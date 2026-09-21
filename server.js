@@ -1,6 +1,5 @@
-import { WebSocketServer } from 'ws';
+import { WebSocketServer, WebSocket } from 'ws';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import { createClient, LiveTranscriptionEvents } from '@deepgram/sdk';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -8,67 +7,75 @@ dotenv.config();
 const port = process.env.PORT || 8080;
 const wss = new WebSocketServer({ port });
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
-const model = genAI.getGenerativeModel({ 
+const geminiKey = process.env.GEMINI_API_KEY || '';
+const deepgramKey = process.env.DEEPGRAM_API_KEY || '';
+
+const genAI = new GoogleGenerativeAI(geminiKey);
+const model = genAI.getGenerativeModel({
   model: 'gemini-1.5-flash',
-  systemInstruction: 'तुम एक विनम्र, तेज और पेशेवर AI कॉल असिस्टेंट हो। कॉलर से हिंदी या हिंग्लिश में बात करो। हमेशा 1 से 2 बहुत छोटे वाक्यों में ही सटीक जवाब दो।'
+  systemInstruction: 'तुम एक विनम्र और तेज AI कॉल असिस्टेंट हो। कॉलर से हिंदी या हिंग्लिश में 1 से 2 छोटे वाक्यों में सटीक बात करो।'
 });
 
-const deepgram = createClient(process.env.DEEPGRAM_API_KEY || '');
+wss.on('connection', (clientWs) => {
+  console.log('फोन कनेक्ट हो गया!');
 
-wss.on('connection', (ws) => {
-  console.log('फोन से कॉल कनेक्ट हो गई!');
-
-  const dgConnection = deepgram.listen.live({
-    model: 'nova-2',
-    language: 'hi',
-    smart_format: true,
-    encoding: 'linear16',
-    sample_rate: 16000,
+  // बिना SDK के सीधे Deepgram WebSocket कनेक्शन (100% क्रैश-फ्री)
+  const dgWs = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova-2&language=hi&smart_format=true&encoding=linear16&sample_rate=16000', {
+    headers: {
+      Authorization: `Token ${deepgramKey}`
+    }
   });
 
-  dgConnection.on(LiveTranscriptionEvents.Open, () => {
-    ws.on('message', (audioChunk) => {
-      if (dgConnection.getReadyState() === 1) {
-        dgConnection.send(audioChunk);
-      }
-    });
+  dgWs.on('open', () => {
+    console.log('Deepgram लाइव कनेक्टेड');
   });
 
-  dgConnection.on(LiveTranscriptionEvents.TranscriptReceived, async (data) => {
-    const transcript = data.channel.alternatives[0]?.transcript;
-    if (transcript && data.is_final && transcript.trim().length > 0) {
-      console.log(`कॉलर: ${transcript}`);
+  clientWs.on('message', (chunk) => {
+    if (dgWs.readyState === WebSocket.OPEN) {
+      dgWs.send(chunk);
+    }
+  });
 
-      try {
+  dgWs.on('message', async (data) => {
+    try {
+      const parsed = JSON.parse(data.toString());
+      const transcript = parsed.channel?.alternatives[0]?.transcript;
+
+      if (transcript && parsed.is_final && transcript.trim().length > 0) {
+        console.log(`कॉलर: ${transcript}`);
+
         const result = await model.generateContent(transcript);
         const replyText = result.response.text();
         console.log(`AI: ${replyText}`);
 
-        // Direct Deepgram REST TTS call (बिना किसी SDK वर्ज़न एरर के)
-        const ttsResponse = await fetch('https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=linear16&sample_rate=16000', {
+        // Direct Text-to-Speech call
+        const ttsRes = await fetch('https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=linear16&sample_rate=16000', {
           method: 'POST',
           headers: {
-            'Authorization': `Token ${process.env.DEEPGRAM_API_KEY}`,
+            Authorization: `Token ${deepgramKey}`,
             'Content-Type': 'application/json'
           },
           body: JSON.stringify({ text: replyText })
         });
 
-        if (ttsResponse.ok) {
-          const arrayBuffer = await ttsResponse.arrayBuffer();
-          ws.send(Buffer.from(arrayBuffer));
+        if (ttsRes.ok) {
+          const arrayBuffer = await ttsRes.arrayBuffer();
+          if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(Buffer.from(arrayBuffer));
+          }
         }
-      } catch (err) {
-        console.error('Error in AI loop:', err);
       }
+    } catch (err) {
+      console.error('Processing error:', err);
     }
   });
 
-  ws.on('close', () => {
-    console.log('कॉल डिस्कनेक्ट हो गई');
-    dgConnection.finish();
+  clientWs.on('close', () => {
+    console.log('फोन डिस्कनेक्ट हुआ');
+    if (dgWs.readyState === WebSocket.OPEN) {
+      dgWs.close();
+    }
   });
 });
 
-console.log(`Server listening on port ${port}`);
+console.log(`Server running on port ${port}`);
