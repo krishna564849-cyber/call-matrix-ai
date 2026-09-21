@@ -1,5 +1,5 @@
 import { WebSocketServer } from 'ws';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createClient, LiveTranscriptionEvents } from '@deepgram/sdk';
 import dotenv from 'dotenv';
 
@@ -7,17 +7,17 @@ dotenv.config();
 
 const port = process.env.PORT || 8080;
 const wss = new WebSocketServer({ port });
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const model = genAI.getGenerativeModel({ 
+  model: 'gemini-1.5-flash',
+  systemInstruction: 'तुम एक विनम्र, तेज और पेशेवर AI कॉल असिस्टेंट हो। कॉलर से हिंदी या हिंग्लिश में बात करो। हमेशा 1 से 2 बहुत छोटे वाक्यों में ही सटीक जवाब दो।'
+});
+
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 
-const SYSTEM_INSTRUCTION = `
-तुम एक विनम्र, तेज और पेशेवर AI कॉल असिस्टेंट हो। 
-कॉलर से हिंदी या हिंग्लिश में बात करो। 
-हमेशा 1 से 2 बहुत छोटे वाक्यों में ही जवाब दो।
-`;
-
 wss.on('connection', (ws) => {
-  console.log('पुराने फोन से कॉल कनेक्ट हो गई!');
+  console.log('फोन से कॉल कनेक्ट हो गई!');
 
   const dgConnection = deepgram.listen.live({
     model: 'nova-2',
@@ -38,22 +38,13 @@ wss.on('connection', (ws) => {
   dgConnection.on(LiveTranscriptionEvents.TranscriptReceived, async (data) => {
     const transcript = data.channel.alternatives[0]?.transcript;
     if (transcript && data.is_final && transcript.trim().length > 0) {
-      console.log(`कॉलर: ${transcript}`);
+      console.log(`कॉलर ने कहा: ${transcript}`);
 
       try {
-        const response = await ai.models.generateContent({
-          model: 'gemini-2.5-flash',
-          contents: [{ role: 'user', parts: [{ text: transcript }] }],
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-            maxOutputTokens: 100,
-          }
-        });
+        const result = await model.generateContent(transcript);
+        const replyText = result.response.text();
+        console.log(`AI का जवाब: ${replyText}`);
 
-        const replyText = response.text();
-        console.log(`AI: ${replyText}`);
-
-        // Deepgram Speak API से तुरंत ऑडियो में बदलें
         const ttsResponse = await deepgram.speak.request(
           { text: replyText },
           { model: 'aura-asteria-en', encoding: 'linear16', container: 'none' }
@@ -61,8 +52,7 @@ wss.on('connection', (ws) => {
         const stream = await ttsResponse.getStream();
         const chunks = [];
         for await (const chunk of stream) chunks.push(chunk);
-        
-        // ऑडियो बाइट्स वापस पुराने फोन को भेजें
+
         ws.send(Buffer.concat(chunks));
       } catch (err) {
         console.error('Error in AI loop:', err);
@@ -71,7 +61,7 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    console.log('कॉल खत्म हुई');
+    console.log('कॉल डिस्कनेक्ट हो गई');
     dgConnection.finish();
   });
 });
